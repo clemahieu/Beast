@@ -1,3 +1,7 @@
+* Add flat_streambuf
+
+--------------------------------------------------------------------------------
+
 1.0.0-b28
 
 * Split out and rename test stream classes
