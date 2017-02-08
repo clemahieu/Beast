@@ -15,6 +15,159 @@
 #include <beast/core/flat_streambuf.hpp>
 #include <beast/core/streambuf.hpp>
 
+#if 0
+/*
+
+1. Linear buffer optimization
+2. Split parsing: read body in a separate call
+3. Relaying: caller has control over the body loop
+
+When a header is parsed, metadata is generated concerning the body:
+
+Three cases of body:
+
+	0. Content-Length
+	1. No Content-Length, End of body determined by eof
+	2. Chunked encoding
+
+*/
+
+std::string const s =
+    "HTTP/1.0 200 OK\r\n"
+    "Server: test\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "Trailer: Expires, MD5-Fingerprint\r\n"
+    "\r\n"
+
+	// 1
+    "5\r\n"
+    "*****\r\n"
+
+	// 2
+    "2;a;b=1;c=\"2\"\r\n"
+    "--\r\n"
+
+	// 3
+    "0;d;e=3;f=\"4\"\r\n"
+    "Expires: never\r\n"
+    "MD5-Fingerprint: -\r\n"
+    "\r\n";
+
+template<class SyncReadStream, class DynamicBuffer,
+    bool isRequest, class Body, class Fields>
+void
+new_read(SyncReadStream& stream, DynamicBuffer& dynabuf,
+    message<isRequest, Body, Fields>& msg, error_code& ec)
+{
+    using boost::asio::buffer_copy;
+
+    new_parser_v1<isRequest, Fields> p{msg};
+	BOOST_ASSERT(! p.done());
+	BOOST_ASSERT(! p.have_header());
+
+    // Read and parse header
+	for(;;)
+    {
+        auto n = p.write(dynabuf.data(), ec);
+        if(! ec)
+        {
+        	dynabuf.consume(n);
+        	break;
+        }
+        if(ec != error::need_more)
+        	return;
+        ec = {};
+        auto const len =
+            read_size_helper(dynabuf, 65536);
+        auto const bytes_transferred =
+            stream.read_some(
+                dynabuf.prepare(len) , ec);
+        if(ec)
+            return;
+        dynabuf.commit(bytes_transferred);
+    }
+    BOOST_ASSERT(p.have_header());
+    BOOST_ASSERT(! p.done()); // ???
+
+	typename Body::reader r{msg};
+    r.init(p.content_length(), ec);
+    if(ec)
+        return;
+
+    // read chunks or non-encoded body data
+    for(;;)
+    {
+      	std::size_t n;
+      	// this loop only does something if chunked
+        for(;;)
+        {
+            n = p.write(dynabuf.data(), ec);
+            if(! ec)
+                break;
+            if(ec != error::need_more)
+                return;
+            ec = {};
+            auto const len =
+                read_size_helper(dynabuf, 512);
+            auto const bytes_transferred =
+                stream.read_some(
+                    dynabuf.prepare(len) , ec);
+          	if(ec == boost::asio::error::eof)
+            {
+              	ec = {};
+              	p.write_eof(ec);
+              	BOOST_ASSERT(ec);
+              	return;
+            }
+            if(ec)
+                return;
+            dynabuf.commit(bytes_transferred);
+        }     
+      	if(p.done())
+			break;
+
+      	// process p.chunk_ext() before calling consume
+        dynabuf.consume(n); // p.chunk_ext() now invalidated
+
+      	auto b = r.prepare(p.body_how() != 1 ?
+			p.body_remain() : 65536, ec);
+		if(ec)
+          	return;
+
+      	consuming_buffers<decltype(b)> cb{b};
+
+      	// copy body bytes if any from dynabuf to reader
+        n = p.body_copy(cb, dynabuf);
+        cb.consume(n);
+      	dynabuf.consume(n);
+
+      	// read the remainder of the chunk or body data
+		while(boost::asio::buffer_size(cb) > 0)
+        {
+            auto const bytes_transferred =
+                stream.read_some(cb, ec);
+            if(ec == boost::asio::error::eof)
+            {
+                ec = {};
+                p.write_eof(bp, ec);
+                if(ec)
+                    return;
+                BOOST_ASSERT(p.done());
+              	goto done;
+            }
+            if(ec)
+                return;
+            cb.commit(bytes_transferred);
+          	p.body_consume(bytes_transferred);
+        }
+    }
+done:
+    r.finish(ec);
+    if(ec)
+      return;
+}
+#endif
+
 namespace beast {
 namespace http {
 
@@ -29,9 +182,16 @@ struct str_body
 
     public:
         template<bool isRequest, class Fields>
-        reader(message<isRequest, str_body, Fields>& msg,
-            boost::optional<std::uint64_t> content_length)
+        explicit
+        reader(message<isRequest, str_body, Fields>& msg)
             : body_(msg.body)
+        {
+        }
+
+        void
+        init(boost::optional<
+            std::uint64_t> const& content_length,
+                error_code& ec)
         {
             if(content_length)
             {
@@ -76,24 +236,21 @@ new_read(SyncReadStream& stream, DynamicBuffer& dynabuf,
     using boost::asio::buffer_copy;
 
     new_parser_v1<isRequest, Fields> p{msg};
+	BOOST_ASSERT(! p.done());
+	BOOST_ASSERT(! p.have_header());
 
     // Read and parse header
-    if(dynabuf.size() == 0)
-        goto do_read;
     for(;;)
     {
+        auto n = p.write(dynabuf.data(), ec);
+        if(! ec)
         {
-            auto n = p.write(dynabuf.data(), ec);
-            if(! ec)
-            {
-                dynabuf.consume(n);
-                break;
-            }
-            if(ec != error::need_more)
-                return;
-            ec = {};
+            dynabuf.consume(n);
+            break;
         }
-    do_read:
+        if(ec != error::need_more)
+            return;
+        ec = {};
         auto const len =
             read_size_helper(dynabuf, 65536);
         auto const bytes_transferred =
@@ -103,10 +260,16 @@ new_read(SyncReadStream& stream, DynamicBuffer& dynabuf,
             return;
         dynabuf.commit(bytes_transferred);
     }
-    typename Body::reader r{msg, p.content_length()};
+    BOOST_ASSERT(p.have_header());
+    BOOST_ASSERT(! p.done()); // ???
 
-    // Read and parse body
-    while(! p.complete())
+    typename Body::reader r{msg};
+    r.init(p.content_length(), ec);
+    if(ec)
+        return;
+
+    // Read and parse body data
+    while(! p.done())
     {
         // maybe read chunk delimiter
         for(;;)
@@ -136,9 +299,12 @@ new_read(SyncReadStream& stream, DynamicBuffer& dynabuf,
             return;
 
         // read remaining part of chunk
-        auto const remain = p.remain();
-        if(remain > 0)
+        for(;;)
         {
+            auto const remain = p.remain();
+            if(remain == 0)
+                break;
+
             auto const b = r.prepare(remain, ec);
             if(ec)
                 return;
@@ -150,7 +316,8 @@ new_read(SyncReadStream& stream, DynamicBuffer& dynabuf,
                 p.write_eof(ec);
                 if(ec)
                     return;
-                BOOST_ASSERT(p.complete());
+                BOOST_ASSERT(p.done());
+                break;
             }
             else
             {
@@ -271,7 +438,7 @@ public:
     {
         beast::test::string_istream ss{get_io_service(), s};
         error_code ec;
-    #if 0
+    #if 1
         streambuf dynabuf;
     #else
         flat_streambuf dynabuf;
@@ -378,7 +545,8 @@ public:
         relay<false>(is, os, ec, yield, transform{});
     }
 
-    void run() override
+    void
+    run() override
     {
         testRead();
         yield_to(std::bind(
@@ -392,3 +560,4 @@ BEAST_DEFINE_TESTSUITE(new_parser,http,beast);
 
 } // http
 } // beast
+

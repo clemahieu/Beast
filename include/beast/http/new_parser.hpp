@@ -248,7 +248,7 @@ class new_basic_parser_v1
     static unsigned constexpr flagChunked = 2;
     static unsigned constexpr flagUpgrade = 4;
     static unsigned constexpr flagHeader = 8;
-    static unsigned constexpr flagComplete = 16;
+    static unsigned constexpr flagDone = 16;
     static unsigned constexpr flagNextChunk = 32;
     static unsigned constexpr flagFinalChunk = 64;
     static unsigned constexpr flagSkipBody = 128;
@@ -269,9 +269,16 @@ public:
     /** Returns `true` if a complete message has been received.
     */
     bool
-    complete() const
+    done() const
     {
-        return (f_ & flagComplete) != 0;
+        return (f_ & flagDone) != 0;
+    }
+
+    /// Returns true if we have already received a complete header.
+    bool
+    have_header() const
+    {
+        return (f_ & flagHeader) != 0;
     }
 
     /** Returns the optional value of Content-Length if known.
@@ -352,7 +359,7 @@ public:
     {
         if(f_ & (flagContentLength | flagChunked))
         {
-            if(! (f_ & flagComplete))
+            if(! (f_ & flagDone))
             {
                 ec = error::short_read;
                 return;
@@ -360,7 +367,7 @@ public:
         }
         else
         {
-            f_ |= flagComplete;
+            f_ |= flagDone;
         }
     }
 
@@ -387,7 +394,7 @@ public:
         {
             len_ -= len;
             if(len_ == 0)
-                f_ |= flagComplete;
+                f_ |= flagDone;
         }
         else if(f_ & flagChunked)
         {
@@ -1030,7 +1037,7 @@ private:
                     return;
 
             }
-            f_ |= flagComplete;
+            f_ |= flagDone;
         }
     }
 };
